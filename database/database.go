@@ -23,7 +23,19 @@ func Generate(config *model.DbConfig) {
 		os.Exit(1)
 	}
 	defer db.Close()
-	dbInfo := getDbInfo(db)
+
+	var dbInfo model.DbInfo
+
+	if config.DbType == 1 {
+		dbInfo = getDbInfo(db)
+	}
+	if config.DbType == 2 {
+		dbInfo = getDbInfo(db)
+	}
+	if config.DbType == 3 {
+		dbInfo = getPgDbInfo(db)
+	}
+
 	dbInfo.DbName = config.Database
 	tables := getTableInfo(db)
 	// create
@@ -104,6 +116,57 @@ func getDbInfo(db *sql.DB) model.DbInfo {
 	defer rows.Close()
 	for rows.Next() {
 		rows.Scan(&key, &value)
+	}
+	info.Collation = value
+	return info
+}
+
+func getPgDbInfo(db *sql.DB) model.DbInfo {
+	var (
+		info  model.DbInfo
+		rows  *sql.Rows
+		err   error
+		value string
+	)
+	// PostgreSQL中没有@@version这样的系统变量，我们使用替代的查询
+	rows, err = db.Query("SHOW server_version;")
+	if err != nil {
+		fmt.Println(err)
+		return info // 不要忘记返回空的info
+	}
+	defer rows.Close()
+	for rows.Next() {
+		rows.Scan(&value)
+	}
+	info.Version = value
+	// 字符集，PostgreSQL中查询字符集的SQL语句不同
+	rows, err = db.Query("SHOW server_encoding;")
+	if err != nil {
+		fmt.Println(err)
+		return info // 不要忘记返回空的info
+	}
+	defer rows.Close()
+	for rows.Next() {
+		rows.Scan(&value)
+	}
+	info.Charset = value
+	// // 排序规则，PostgreSQL中查询排序规则的SQL语句不同
+	// err = db.QueryRow("SHOW lc_collate;").Scan(&value)
+	// if err != nil {
+	// 	fmt.Println(err)
+	// 	return info // 如果查询失败，返回空的info
+	// }
+	// info.Collation = value
+
+	// 排序规则，PostgreSQL中查询排序规则的SQL语句不同
+	rows, err = db.Query("SHOW lc_collate;")
+	if err != nil {
+		fmt.Println(err)
+		return info // 不要忘记返回空的info
+	}
+	defer rows.Close()
+	for rows.Next() {
+		rows.Scan(&value)
 	}
 	info.Collation = value
 	return info
@@ -233,56 +296,45 @@ func getColumnSQL(tableName string) string {
 	}
 	if dbConfig.DbType == 3 {
 		sql = fmt.Sprintf(`
-		select
-			column_name as ColName,
-			data_type as ColType,
-			case
-				when b.pk_name is null then ''
-				else 'PRI'
-			end as ColKey,
-			is_nullable as IsNullable,
-			c.DeText as ColComment,
-			column_default as ColDefault
-		from
-			information_schema.columns
-		left join (
-			select
-				pg_attr.attname as colname,
-				pg_constraint.conname as pk_name
-			from
-				pg_constraint
-			inner join pg_class on
-				pg_constraint.conrelid = pg_class.oid
-			inner join pg_attribute pg_attr on
-				pg_attr.attrelid = pg_class.oid
-				and pg_attr.attnum = pg_constraint.conkey[1]
-			inner join pg_type on
-				pg_type.oid = pg_attr.atttypid
-			where
-				pg_class.relname = 'file_sources'
-				and pg_constraint.contype = 'p' ) b on
-			b.colname = information_schema.columns.column_name
-		left join (
-			select
-				attname,
-				description as DeText
-			from
-				pg_class
-			left join pg_attribute pg_attr on
-				pg_attr.attrelid = pg_class.oid
-			left join pg_description pg_desc on
-				pg_desc.objoid = pg_attr.attrelid
-				and pg_desc.objsubid = pg_attr.attnum
-			where
-				pg_attr.attnum>0
-				and pg_attr.attrelid = pg_class.oid
-				and pg_class.relname = 'file_sources' )c on
-			c.attname = information_schema.columns.column_name
-		where
-			table_schema = 'public'
-			and table_name = '%s'
-		order by
-			ordinal_position desc`, tableName)
+		SELECT
+		COLUMN_NAME AS ColName,
+		data_type AS ColType,
+		CASE
+				WHEN b.pk_name IS NULL THEN ''
+				ELSE 'PRI'
+		END AS ColKey,
+		is_nullable AS IsNullable,
+		pgd.description AS ColComment,
+		column_default AS ColDefault
+FROM
+		information_schema.COLUMNS
+		LEFT JOIN (
+				SELECT
+						pg_attribute.attname AS colname,
+						pg_constraint.conname AS pk_name
+				FROM
+						pg_constraint
+						INNER JOIN pg_class ON pg_constraint.conrelid = pg_class.oid
+						INNER JOIN pg_attribute ON pg_attribute.attrelid = pg_class.oid
+								AND pg_attribute.attnum = ANY(pg_constraint.conkey)
+						INNER JOIN pg_type ON pg_type.oid = pg_attribute.atttypid
+				WHERE
+						pg_class.relname = '%s' -- 这里应该是你要查询的表名
+						AND pg_constraint.contype = 'p'
+		) b ON b.colname = information_schema.COLUMNS.COLUMN_NAME
+		LEFT JOIN pg_description pgd ON pgd.objoid = ( -- 关联到pg_description
+				SELECT
+						pg_class.oid
+				FROM
+						pg_class
+				WHERE
+						pg_class.relname = information_schema.COLUMNS.TABLE_NAME
+		) AND pgd.objsubid = information_schema.COLUMNS.ORDINAL_POSITION
+WHERE
+		table_schema = 'public'
+		AND TABLE_NAME = '%s' -- 这里也应该是你要查询的表名
+ORDER BY
+		ordinal_position;`, tableName, tableName)
 	}
 	return sql
 }
